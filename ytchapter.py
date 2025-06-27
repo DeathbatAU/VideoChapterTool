@@ -22,7 +22,6 @@ class VideoChapterTool:
         self.chapters = []
         self.processing = False
         self.downloading = False
-        self.extracting_comments = False
         self.batch_processing = False
         self.batch_results = []
         
@@ -66,9 +65,8 @@ class VideoChapterTool:
         
         youtube_buttons_frame = ttk.Frame(input_frame)
         youtube_buttons_frame.grid(row=2, column=2, padx=5, pady=5, sticky="w")
-        ttk.Button(youtube_buttons_frame, text="Download Video", command=self.start_youtube_download_thread).pack(side=tk.LEFT, fill="x", expand=True, padx=(0, 2))
-        ttk.Button(youtube_buttons_frame, text="Extract Chapters", command=self.start_extract_comments_thread).pack(side=tk.LEFT, fill="x", expand=True)
-
+        ttk.Button(youtube_buttons_frame, text="Download Video", command=self.start_youtube_download_thread).pack(side=tk.LEFT, fill="x", expand=True)
+        # Removed the "Extract Chapters" button from here
 
         # --- Chapter Input and Display ---
         chapter_frame = ttk.LabelFrame(self.root, text="Chapters Input/Editor")
@@ -199,7 +197,23 @@ class VideoChapterTool:
 
     def _download_youtube_video(self, url):
         try:
-            command = [self.yt_dlp_path, '-f', 'bestvideo+bestaudio/best', '--merge-output-format', 'mp4', url, '-o', 'downloaded_video.%(ext)s']
+            # First, get video title to use as filename
+            info_command = [self.yt_dlp_path, '--get-title', url]
+            title_process = subprocess.Popen(info_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8')
+            title_output, title_error = title_process.communicate()
+
+            if title_process.returncode != 0:
+                self.log_message(f"Error getting video title: {title_error.strip()}")
+                return
+
+            video_title = title_output.strip()
+            # Sanitize filename
+            sanitized_title = re.sub(r'[\\/:*?"<>|]', '', video_title)
+            output_template = f"{sanitized_title}.%(ext)s"
+
+            self.log_message(f"Downloading YouTube video '{video_title}' to '{output_template}'...")
+
+            command = [self.yt_dlp_path, '-f', 'bestvideo+bestaudio/best', '--merge-output-format', 'mp4', url, '-o', output_template]
             
             process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             for line in iter(process.stdout.readline, ''):
@@ -213,13 +227,19 @@ class VideoChapterTool:
             process.wait()
 
             if process.returncode == 0:
-                downloaded_files = [f for f in os.listdir('.') if re.match(r'downloaded_video\.(mp4|mkv|webm|flv|avi)', f)]
-                if downloaded_files:
-                    downloaded_path = os.path.abspath(downloaded_files[0])
-                    self.video_path.set(downloaded_path)
-                    self.log_message(f"YouTube video downloaded successfully to: {downloaded_path}")
+                # Find the downloaded file based on the sanitized title and common extensions
+                downloaded_file = None
+                for ext in ['mp4', 'mkv', 'webm', 'flv', 'avi']: # Common extensions
+                    potential_path = f"{sanitized_title}.{ext}"
+                    if os.path.exists(potential_path):
+                        downloaded_file = os.path.abspath(potential_path)
+                        break
+
+                if downloaded_file:
+                    self.video_path.set(downloaded_file)
+                    self.log_message(f"YouTube video downloaded successfully to: {downloaded_file}")
                 else:
-                    self.log_message("Error: Downloaded video file not found after successful download command.")
+                    self.log_message("Error: Downloaded video file not found after successful download command (check expected filename).")
             else:
                 self.log_message(f"YouTube download failed with exit code {process.returncode}")
                 self.log_message(f"stderr: {stderr_output}")
@@ -230,51 +250,7 @@ class VideoChapterTool:
             self.downloading = False
             self.progress_bar.stop()
 
-
-    def start_extract_comments_thread(self):
-        if self.yt_dlp_path is None:
-            messagebox.showerror("Error", "yt-dlp executable not found. Please place it in the script folder or ensure it's on your system's PATH. Check the log for details.")
-            return
-
-        url = self.youtube_url.get().strip()
-        if not url:
-            messagebox.showerror("Error", "Please enter a YouTube URL to extract comments from.")
-            return
-        if self.extracting_comments:
-            self.log_message("Already extracting comments. Please wait.")
-            return
-
-        self.extracting_comments = True
-        self.log_message(f"Starting extraction of comments for: {url}")
-        threading.Thread(target=self._extract_youtube_comments, args=(url,)).start()
-
-    def _extract_youtube_comments(self, url):
-        try:
-            command = [self.yt_dlp_path, '--skip-download', '--print-json', '--extractor-args', 'youtube:comments', url]
-            
-            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            stdout, stderr = process.communicate()
-
-            if process.returncode == 0:
-                try:
-                    self.log_message("Attempted to extract comments JSON. Please review the log for raw data.")
-                    self.log_message("If comments containing chapters are visible, please copy them into the 'Chapters Input/Editor' text area.")
-                    self.log_message(f"Raw yt-dlp output for comments extraction:\n{stdout[:1000]}...")
-
-                except json.JSONDecodeError:
-                    self.log_message("Failed to parse yt-dlp output as JSON. It might not have returned valid JSON for comments.")
-                    self.log_message(f"Raw yt-dlp output:\n{stdout}")
-                except Exception as e:
-                    self.log_message(f"An error occurred during comment parsing: {e}")
-            else:
-                self.log_message(f"YouTube comment extraction failed with exit code {process.returncode}")
-                self.log_message(f"stderr: {stderr.strip()}")
-
-        except Exception as e:
-            self.log_message(f"An error occurred during YouTube comment extraction: {e}")
-        finally:
-            self.extracting_comments = False
-            self.progress_bar.stop()
+    # Removed start_extract_comments_thread and _extract_youtube_comments functions
 
     def parse_chapters_from_text_wrapper(self):
         comment_text = self.chapter_text.get("1.0", tk.END)
@@ -448,7 +424,6 @@ class VideoChapterTool:
         self.progress_bar.stop()
         self.processing = False
         self.downloading = False
-        self.extracting_comments = False
         self.batch_processing = False
         self.batch_results = []
         self.log_message("All cleared.")
