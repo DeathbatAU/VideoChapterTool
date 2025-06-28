@@ -75,8 +75,19 @@ class VideoChapterTool:
         self.chapter_text = scrolledtext.ScrolledText(chapter_frame, wrap=tk.WORD, width=80, height=15)
         self.chapter_text.pack(padx=5, pady=5, fill="both", expand=True)
 
-        parse_button = ttk.Button(chapter_frame, text="Parse Chapters from Text", command=self.parse_chapters_from_text_wrapper)
-        parse_button.pack(pady=5)
+        # Frame for buttons below the text area
+        chapter_buttons_frame = ttk.Frame(chapter_frame)
+        chapter_buttons_frame.pack(pady=5, fill='x', padx=5)
+
+        # Make the columns in the frame expand equally
+        chapter_buttons_frame.grid_columnconfigure(0, weight=1)
+        chapter_buttons_frame.grid_columnconfigure(1, weight=1)
+
+        parse_button = ttk.Button(chapter_buttons_frame, text="Parse Chapters from Text", command=self.parse_chapters_from_text_wrapper)
+        parse_button.grid(row=0, column=0, padx=(0, 2), sticky='ew')
+
+        launch_creator_button = ttk.Button(chapter_buttons_frame, text="Launch Batch Chapter File Creator", command=self.launch_chapter_creator)
+        launch_creator_button.grid(row=0, column=1, padx=(2, 0), sticky='ew')
 
         # --- Actions (Apply Chapters) ---
         action_frame = ttk.LabelFrame(self.root, text="Apply Chapters to Video")
@@ -513,6 +524,25 @@ class VideoChapterTool:
         self.batch_processing = False
         self.progress_bar.stop()
 
+    def launch_chapter_creator(self):
+        """Launches the chapter_file_creator.py script in a new process."""
+        script_name = "chapter_file_creator.py"
+        # Assume the script is in the same directory as the main script
+        # sys.executable is the path to the current python interpreter
+        script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), script_name)
+
+        if not os.path.exists(script_path):
+            self.log_message(f"ERROR: Could not find {script_name}. Make sure it's in the same folder as this script.")
+            messagebox.showerror("Error", f"Could not find {script_name}. Make sure it's in the same folder.")
+            return
+
+        try:
+            self.log_message(f"Launching {script_name}...")
+            # Use subprocess.Popen to run the script in a new, non-blocking process
+            subprocess.Popen([sys.executable, script_path])
+        except Exception as e:
+            self.log_message(f"Failed to launch {script_name}: {e}")
+            messagebox.showerror("Error", f"An error occurred while trying to launch the script: {e}")
 
     def log_message(self, message):
         self.status_text.config(state='normal')
