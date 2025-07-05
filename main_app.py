@@ -110,12 +110,20 @@ class VideoChapterTool:
 
     def _find_executable_path(self, base_name):
         """
-        Finds the full path to an executable, prioritizing the script's directory.
+        Finds the full path to an executable, prioritizing PyInstaller's temp path,
+        then the script's directory, then system PATH.
         """
+        # 1. Check PyInstaller's temporary extraction path (when bundled)
+        if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+            temp_path = os.path.join(sys._MEIPASS, base_name)
+            temp_path_exe = os.path.join(sys._MEIPASS, base_name + ".exe") # For Windows
+            if sys.platform == "win32" and os.path.exists(temp_path_exe):
+                return temp_path_exe
+            elif os.path.exists(temp_path):
+                return temp_path
+
+        # 2. Check the script's original directory (for non-bundled runs or if user places it there)
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        
-        # Check for platform-specific names (e.g., .exe on Windows)
-        # We check both base_name and base_name.exe on Windows for local files
         local_path = os.path.join(script_dir, base_name)
         local_path_exe = os.path.join(script_dir, base_name + ".exe")
 
@@ -124,8 +132,7 @@ class VideoChapterTool:
         elif os.path.exists(local_path) and os.path.isfile(local_path):
             return local_path
         
-        # Fallback to checking PATH using shutil.which
-        # shutil.which handles .exe extension and PATHEXT on Windows automatically
+        # 3. Fallback to system PATH using shutil.which
         return shutil.which(base_name)
 
     def check_dependencies(self):
@@ -154,29 +161,38 @@ class VideoChapterTool:
         chapters = []
         lines = [line.strip() for line in comment_text.split('\n') if line.strip()]
 
-        pattern1 = r'^(\d{1,2}:\d{2})\s*[-:]?\s*(.+?)$'  # Time first
-        pattern2 = r'^(.+?)\s*[-:]?\s*(\d{1,2}:\d{2})$'  # Title first
-
-        matches1 = []
-        matches2 = []
+        # Changed regex to explicitly capture H:M:S for better parsing
+        # It handles optional hours.
+        pattern1 = re.compile(r'^(?:(\d{1,2}):)?(\d{1,2}):(\d{2})\s*[-:]?\s*(.+?)$')  # HH:MM:SS or MM:SS followed by title
+        pattern2 = re.compile(r'^(.+?)\s*[-:]?\s*(?:(\d{1,2}):)?(\d{1,2}):(\d{2})$')  # Title followed by HH:MM:SS or MM:SS
 
         for line in lines:
-            match1 = re.match(pattern1, line)
-            match2 = re.match(pattern2, line)
+            match = pattern1.match(line)
+            if match:
+                # If group 1 (hours) exists, use it, otherwise 0
+                hours = int(match.group(1)) if match.group(1) else 0
+                minutes = int(match.group(2))
+                seconds = int(match.group(3))
+                title = match.group(4).strip()
+                
+                # Convert to HH:MM:SS format consistently for storage
+                time_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+                chapters.append((time_str, title))
+                continue
 
-            if match1:
-                matches1.append(match1)
-            elif match2:
-                matches2.append(match2)
+            match = pattern2.match(line)
+            if match:
+                title = match.group(1).strip()
+                hours = int(match.group(2)) if match.group(2) else 0
+                minutes = int(match.group(3))
+                seconds = int(match.group(4))
+                
+                time_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+                chapters.append((time_str, title))
+                continue
+            
+            self.log_message(f"Warning: Could not parse chapter from line: '{line}'")
 
-        use_matches = matches1 if len(matches1) >= len(matches2) else matches2
-
-        for match in use_matches:
-            if len(match.groups()) == 2:
-                time, title = match.groups()
-                if len(time.split(':')) == 2:
-                    time = '00:' + time
-                chapters.append((time, title.strip()))
 
         return chapters
 
@@ -261,32 +277,107 @@ class VideoChapterTool:
             self.downloading = False
             self.progress_bar.stop()
 
-    # Removed start_extract_comments_thread and _extract_youtube_comments functions
-
     def parse_chapters_from_text_wrapper(self):
         comment_text = self.chapter_text.get("1.0", tk.END)
         self.chapters = self.parse_chapters_from_text(comment_text)
         self.log_message(f"Parsed {len(self.chapters)} chapters.")
         self.chapter_text.delete("1.0", tk.END)
-        for time, title in self.chapters:
-            self.chapter_text.insert(tk.END, f"{time} {title}\n")
+        for time_str, title in self.chapters: # Using time_str for consistency with parsing logic
+            self.chapter_text.insert(tk.END, f"{time_str} {title}\n")
 
     def _generate_ffmpeg_chapters_metadata(self, chapters):
         metadata_content = [
             ";FFMETADATA1",
-            "[CHAPTER]",
-            "TIMEBASE=1/1000"
+            "; This section can be used for global metadata, like video title."
+            # "title=My Video Title"
         ]
-        for start_time_str, title in chapters:
+
+        # Process chapters to include START and calculated END times
+        processed_chapters = []
+        for i, (start_time_str, title) in enumerate(chapters):
             h, m, s = map(int, start_time_str.split(':'))
             start_ms = (h * 3600 + m * 60 + s) * 1000
+            
+            processed_chapters.append({
+                'start_ms': start_ms,
+                'title': title,
+            })
+            
+        # Calculate END times based on the next chapter's start time
+        for i in range(len(processed_chapters)):
+            # If not the last chapter, end_ms is the start_ms of the next chapter
+            if i < len(processed_chapters) - 1:
+                processed_chapters[i]['end_ms'] = processed_chapters[i+1]['start_ms']
+            else:
+                # For the last chapter, set a reasonable default end time
+                # A common practice is start_ms + 1000 (1 second), or total video duration
+                # For now, let's use a small duration to just mark the point.
+                processed_chapters[i]['end_ms'] = processed_chapters[i]['start_ms'] + 1000 # 1 second after start
+        
+        for chapter_data in processed_chapters:
             metadata_content.extend([
                 "[CHAPTER]",
-                f"START={start_ms}",
-                f"END={start_ms + 1000}",
-                f"title={title}"
+                "TIMEBASE=1/1000", # Define TIMEBASE explicitly for each chapter block
+                f"START={chapter_data['start_ms']}",
+                f"END={chapter_data['end_ms']}",
+                f"title={chapter_data['title']}"
             ])
         return "\n".join(metadata_content)
+    
+    def _clean_existing_chapter_files(self, video_path):
+        """
+        Deletes existing companion .txt chapter files for a given video name.
+        Looks for:
+        - {video_name_without_ext}.txt
+        - {video_name_without_ext}_chapters.txt (if a new file was created previously)
+        """
+        video_dir, video_filename = os.path.split(video_path)
+        base_name, _ = os.path.splitext(video_filename)
+
+        potential_chapter_files = [
+            os.path.join(video_dir, f"{base_name}.txt"),
+            os.path.join(video_dir, f"{base_name}_chapters.txt")
+        ]
+
+        cleaned_count = 0
+        for chapter_file in potential_chapter_files:
+            if os.path.exists(chapter_file):
+                try:
+                    os.remove(chapter_file)
+                    self.log_message(f"Cleaned old companion chapter text file: {os.path.basename(chapter_file)}")
+                    cleaned_count += 1
+                except Exception as e:
+                    self.log_message(f"Warning: Could not delete old companion chapter file {os.path.basename(chapter_file)}: {e}")
+        return cleaned_count
+
+    def _strip_all_metadata_from_video(self, input_video_path, output_video_path):
+        """
+        Strips all metadata (including chapters) from a video file and saves it to a new path.
+        Returns True on success, False on failure.
+        """
+        self.log_message(f"Stripping all metadata from: {os.path.basename(input_video_path)}...")
+        
+        command = [
+            self.ffmpeg_path,
+            '-i', input_video_path,
+            '-map_chapters', '-1', # Tells ffmpeg to not map any chapters from input
+            '-map_metadata', '-1', # Tells ffmpeg to not map any metadata from input
+            '-c', 'copy',
+            output_video_path
+        ]
+
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        # It's generally good practice to read stdout/stderr even if not logging every line
+        stdout_output, stderr_output = process.communicate()
+        
+        if process.returncode == 0:
+            self.log_message(f"Metadata stripped successfully. Output to: {os.path.basename(output_video_path)}")
+            return True
+        else:
+            self.log_message(f"Failed to strip metadata from {os.path.basename(input_video_path)} with exit code {process.returncode}")
+            self.log_message(f"FFmpeg stdout (strip): {stdout_output.strip()}")
+            self.log_message(f"FFmpeg stderr (strip): {stderr_output.strip()}")
+            return False
 
     def start_burn_chapters_thread(self):
         if self.ffmpeg_path is None:
@@ -307,54 +398,62 @@ class VideoChapterTool:
 
         self.processing = True
         self.log_message(f"Starting to burn chapters into (overwrite): {video_file}")
-        threading.Thread(target=self._burn_chapters_into_video, args=(video_file,)).start()
+        
+        # Determine temporary files for stripping metadata
+        base, ext = os.path.splitext(video_file)
+        temp_stripped_video = f"{base}_stripped{ext}" # Video with all metadata stripped
+        final_temp_output = f"{base}.temp{ext}"       # Final temporary output with new chapters
 
-    def _burn_chapters_into_video(self, video_file):
         try:
+            # Step 1: Strip all existing metadata from the input video
+            # (This will create temp_stripped_video)
+            if not self._strip_all_metadata_from_video(video_file, temp_stripped_video):
+                self.log_message("Aborting chapter burning due to metadata stripping failure.")
+                return
+
+            # Step 2: Create the temporary FFmpeg metadata file
             metadata_file = "chapters_metadata.txt"
             with open(metadata_file, "w", encoding="utf-8") as f:
                 f.write(self._generate_ffmpeg_chapters_metadata(self.chapters))
             
-            output_file = video_file
-            temp_output_file = video_file + ".temp"
-
+            # Step 3: Burn new chapters into the stripped video
             command = [
                 self.ffmpeg_path,
-                '-i', video_file,
+                '-i', temp_stripped_video, # Use the stripped video as input
                 '-i', metadata_file,
-                '-map_metadata', '1',
-                '-map', '0',
-                '-c', 'copy',
-                '-movflags', 'use_metadata_tags',
-                '-f', os.path.splitext(video_file)[1][1:],
-                temp_output_file
+                '-map_metadata', '1', # Map metadata from the .txt file
+                '-map', '0',          # Map all streams from the first input (the stripped video)
+                '-c', 'copy',         # Copy streams without re-encoding
+                '-movflags', 'use_metadata_tags', # Ensures metadata is properly written to mov/mp4
+                final_temp_output     # Output to the final temporary file
             ]
             
-            self.log_message(f"FFmpeg command: {' '.join(command)}")
+            self.log_message(f"FFmpeg command (burn chapters): {' '.join(command)}")
 
             process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            for line in iter(process.stderr.readline, ''):
-                self.log_message(f"FFmpeg: {line.strip()}")
-                self.root.update_idletasks()
-
-            process.wait()
-
+            # It's generally good practice to read stdout/stderr even if not logging every line
+            stdout_output, stderr_output = process.communicate() # Changed to communicate to get all output at once
+            
             if process.returncode == 0:
-                os.replace(temp_output_file, output_file)
-                self.log_message(f"Chapters burned successfully into: {output_file}")
+                os.replace(final_temp_output, video_file) # Overwrite original with the new final temp
+                self.log_message(f"Chapters burned successfully into: {video_file}")
             else:
                 self.log_message(f"Burning chapters failed with exit code {process.returncode}")
-                stdout_output, stderr_output = process.communicate()
-                self.log_message(f"FFmpeg stdout: {stdout_output.strip()}")
-                self.log_message(f"FFmpeg stderr: {stderr_output.strip()}")
+                self.log_message(f"FFmpeg stdout (burn): {stdout_output.strip()}")
+                self.log_message(f"FFmpeg stderr (burn): {stderr_output.strip()}")
 
         except Exception as e:
             self.log_message(f"An error occurred during burning chapters: {e}")
         finally:
             self.processing = False
             self.progress_bar.stop()
+            # Clean up all temporary files created in this process
             if os.path.exists(metadata_file):
                 os.remove(metadata_file)
+            if os.path.exists(temp_stripped_video):
+                os.remove(temp_stripped_video)
+            if os.path.exists(final_temp_output): # Clean this up only if it still exists (e.g., if os.replace failed)
+                os.remove(final_temp_output)
 
 
     def start_create_new_chapter_video_thread(self):
@@ -376,53 +475,60 @@ class VideoChapterTool:
 
         self.processing = True
         self.log_message(f"Starting to create new video with chapters from: {video_file}")
-        threading.Thread(target=self._create_new_chapter_video, args=(video_file,)).start()
+        
+        # Determine temporary file for stripping metadata and final output name
+        base, ext = os.path.splitext(video_file)
+        temp_stripped_video = f"{base}_stripped{ext}" # Video with all metadata stripped
+        output_file = f"{base}_chapters{ext}"       # Final new output file with new chapters
 
-    def _create_new_chapter_video(self, video_file):
         try:
-            base, ext = os.path.splitext(video_file)
-            output_file = f"{base}_chapters{ext}"
-            metadata_file = "chapters_metadata.txt"
+            # Step 1: Strip all existing metadata from the input video
+            # (This will create temp_stripped_video)
+            if not self._strip_all_metadata_from_video(video_file, temp_stripped_video):
+                self.log_message("Aborting new chapter video creation due to metadata stripping failure.")
+                return
 
+            # Step 2: Create the temporary FFmpeg metadata file
+            metadata_file = "chapters_metadata.txt"
             with open(metadata_file, "w", encoding="utf-8") as f:
                 f.write(self._generate_ffmpeg_chapters_metadata(self.chapters))
 
+            # Step 3: Burn new chapters into the stripped video to the final output file
             command = [
                 self.ffmpeg_path,
-                '-i', video_file,
+                '-i', temp_stripped_video, # Use the stripped video as input
                 '-i', metadata_file,
-                '-map_metadata', '1',
-                '-map', '0',
-                '-c', 'copy',
-                '-movflags', 'use_metadata_tags',
-                '-f', ext[1:],
-                output_file
+                '-map_metadata', '1', # Map metadata from the .txt file
+                '-map', '0',          # Map all streams from the first input (the stripped video)
+                '-c', 'copy',         # Copy streams without re-encoding
+                '-movflags', 'use_metadata_tags', # Ensures metadata is properly written to mov/mp4
+                output_file           # Direct output to the new suffixed file
             ]
             
-            self.log_message(f"FFmpeg command: {' '.join(command)}")
+            self.log_message(f"FFmpeg command (create new with chapters): {' '.join(command)}")
 
             process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            for line in iter(process.stderr.readline, ''):
-                self.log_message(f"FFmpeg: {line.strip()}")
-                self.root.update_idletasks()
-
-            process.wait()
+            # It's generally good practice to read stdout/stderr even if not logging every line
+            stdout_output, stderr_output = process.communicate() # Changed to communicate to get all output at once
 
             if process.returncode == 0:
                 self.log_message(f"New video with chapters created successfully: {output_file}")
             else:
                 self.log_message(f"Creating new video with chapters failed with exit code {process.returncode}")
-                stdout_output, stderr_output = process.communicate()
-                self.log_message(f"FFmpeg stdout: {stdout_output.strip()}")
-                self.log_message(f"FFmpeg stderr: {stderr_output.strip()}")
+                self.log_message(f"FFmpeg stdout (create): {stdout_output.strip()}")
+                self.log_message(f"FFmpeg stderr (create): {stderr_output.strip()}")
 
         except Exception as e:
             self.log_message(f"An error occurred during creating new chapter video: {e}")
         finally:
             self.processing = False
             self.progress_bar.stop()
+            # Clean up temporary metadata file and stripped video
             if os.path.exists(metadata_file):
                 os.remove(metadata_file)
+            if os.path.exists(temp_stripped_video):
+                os.remove(temp_stripped_video)
+
 
     def clear_all(self):
         self.log_message("Clearing all inputs and log...")
@@ -503,15 +609,63 @@ class VideoChapterTool:
             if batch_chapters:
                 original_chapters = list(self.chapters) 
                 self.chapters = batch_chapters
-                self.log_message(f"Applying chapters to {video_file_name} (creating new file)...")
+                
+                # In batch mode, we always create a new file with chapters
+                # So we strip metadata from the original video, then add chapters to a NEW output file.
+                base_name_for_new_file, ext_for_new_file = os.path.splitext(full_video_path)
+                batch_stripped_video = f"{base_name_for_new_file}_stripped_batch{ext_for_new_file}"
+                final_output_file_batch = f"{base_name_for_new_file}_chapters{ext_for_new_file}"
+
+                self.log_message(f"Applying chapters to {video_file_name} (creating new file '{os.path.basename(final_output_file_batch)}')")
                 try:
-                    self._create_new_chapter_video(full_video_path)
-                    self.batch_results.append((video_file_name, "Success"))
+                    # Step 1: Strip metadata from the *original* video to a temporary stripped copy
+                    if not self._strip_all_metadata_from_video(full_video_path, batch_stripped_video):
+                        self.log_message(f"Aborting processing for {video_file_name} due to metadata stripping failure.")
+                        self.batch_results.append((video_file_name, "Failed (metadata strip)"))
+                        continue # Move to next video in batch
+
+                    # Step 2: Create the temporary FFmpeg metadata file (for this video in batch)
+                    batch_metadata_file = f"chapters_metadata_batch_{i}.txt" # Unique name for batch files
+                    with open(batch_metadata_file, "w", encoding="utf-8") as f:
+                        f.write(self._generate_ffmpeg_chapters_metadata(self.chapters))
+
+                    # Step 3: Burn new chapters into the stripped video to the final output file
+                    command = [
+                        self.ffmpeg_path,
+                        '-i', batch_stripped_video, # Use the stripped video as input
+                        '-i', batch_metadata_file,
+                        '-map_metadata', '1',
+                        '-map', '0',
+                        '-c', 'copy',
+                        '-movflags', 'use_metadata_tags',
+                        final_output_file_batch
+                    ]
+                    
+                    self.log_message(f"FFmpeg command (batch new chapter video): {' '.join(command)}")
+
+                    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    # Reading stderr directly instead of iter() for simpler batch error handling
+                    stdout_output, stderr_output = process.communicate() 
+
+                    if process.returncode == 0:
+                        self.log_message(f"Batch new video with chapters created successfully: {os.path.basename(final_output_file_batch)}")
+                        self.batch_results.append((video_file_name, "Success"))
+                    else:
+                        self.log_message(f"Creating new batch video with chapters failed for {video_file_name} with exit code {process.returncode}")
+                        self.log_message(f"FFmpeg stdout (batch new): {stdout_output.strip()}")
+                        self.log_message(f"FFmpeg stderr (batch new): {stderr_output.strip()}")
+                        self.batch_results.append((video_file_name, f"Failed: {stderr_output.strip()[:100]}...")) # Log a snippet
+                        
                 except Exception as e:
-                    self.log_message(f"Failed to process {video_file_name}: {e}")
+                    self.log_message(f"An unexpected error occurred during batch processing for {video_file_name}: {e}")
                     self.batch_results.append((video_file_name, f"Failed: {e}"))
                 finally:
                     self.chapters = original_chapters
+                    # Clean up temporary files for this specific video in batch
+                    if os.path.exists(batch_metadata_file):
+                        os.remove(batch_metadata_file)
+                    if os.path.exists(batch_stripped_video):
+                        os.remove(batch_stripped_video)
             else:
                 self.batch_results.append((video_file_name, "Skipped (no chapters found)"))
             
@@ -527,22 +681,35 @@ class VideoChapterTool:
     def launch_chapter_creator(self):
         """Launches the chapter_file_creator.py script in a new process."""
         script_name = "chapter_file_creator.py"
-        # Assume the script is in the same directory as the main script
-        # sys.executable is the path to the current python interpreter
-        script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), script_name)
+        
+        # Determine if running as a PyInstaller bundled executable
+        if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+            # Running from PyInstaller bundle
+            bundled_script_path = os.path.join(sys._MEIPASS, script_name)
+            
+            self.log_message(f"Launching bundled {script_name} from {bundled_script_path}...")
+            try:
+                # Launch a new process using the *current* executable (the bundled .exe)
+                # and pass the bundled script path as an argument.
+                subprocess.Popen([sys.executable, bundled_script_path])
+            except Exception as e:
+                self.log_message(f"Failed to launch bundled {script_name}: {e}")
+                messagebox.showerror("Error", f"An error occurred while trying to launch the bundled script: {e}")
+        else:
+            # Running as a standard Python script
+            script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), script_name)
 
-        if not os.path.exists(script_path):
-            self.log_message(f"ERROR: Could not find {script_name}. Make sure it's in the same folder as this script.")
-            messagebox.showerror("Error", f"Could not find {script_name}. Make sure it's in the same folder.")
-            return
+            if not os.path.exists(script_path):
+                self.log_message(f"ERROR: Could not find {script_name}. Make sure it's in the same folder as this script.")
+                messagebox.showerror("Error", f"Could not find {script_name}. Make sure it's in the same folder.")
+                return
 
-        try:
-            self.log_message(f"Launching {script_name}...")
-            # Use subprocess.Popen to run the script in a new, non-blocking process
-            subprocess.Popen([sys.executable, script_path])
-        except Exception as e:
-            self.log_message(f"Failed to launch {script_name}: {e}")
-            messagebox.showerror("Error", f"An error occurred while trying to launch the script: {e}")
+            try:
+                self.log_message(f"Launching {script_name}...")
+                subprocess.Popen([sys.executable, script_path])
+            except Exception as e:
+                self.log_message(f"Failed to launch {script_name}: {e}")
+                messagebox.showerror("Error", f"An error occurred while trying to launch the script: {e}")
 
     def log_message(self, message):
         self.status_text.config(state='normal')
